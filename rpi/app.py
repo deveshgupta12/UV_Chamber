@@ -37,18 +37,23 @@ class StreamingOutput(io.BufferedIOBase):
 # --- Global State & Locks ---
 state_lock = threading.Lock()
 blink_lock = threading.Lock()
+uart_lock = threading.Lock()
 capture_in_progress = False
 
 timer = time.time()
 client_status = {'last_ping': None, 'status': False}
 
-# Global Battery Telemetry from ESP32
-battery_data = {
+# Global Telemetry from ESP32
+esp32_data = {
     'voltage': 0.0,
     'soc': 0,
+    'led1': False,
+    'led2': False,
     'last_updated': None,
     'connected': False
 }
+
+serial_port = None
 
 # --- Camera Initialization ---
 try:
@@ -73,48 +78,68 @@ except Exception as e:
     logging.error(f"Failed to initialize camera: {e}")
     streaming_output = None
 
-# --- Hardware Setup ---
+# --- Hardware Setup (Local Pi Pins) ---
 led1_button = Button(17)
 led2_button = Button(21)
 capture_button = Button(4, hold_time=2)
 
-led1 = LED(18, active_high=False)
-led2 = LED(23, active_high=False)
-# NOTE: Moved from GPIO 15 to GPIO 24 to prevent conflict with UART0 RX (GPIO 15)
+# Camera activity indicator LED (moved to GPIO 24 to preserve GPIO 15 for UART0 RX)
 ledc = LED(24)
 
-# Initial LED state
-led1.on()
-led2.on()
+# --- ESP32 UART Communication ---
+def send_esp32_cmd(cmd: str):
+    """Sends a command string to the ESP32 over UART (thread-safe)."""
+    global serial_port
+    cmd_str = cmd.strip() + "\n"
+    with uart_lock:
+        if serial_port and serial_port.is_open:
+            try:
+                serial_port.write(cmd_str.encode('utf-8'))
+                serial_port.flush()
+                logging.info(f"Sent command to ESP32: {cmd.strip()}")
+                return True
+            except Exception as e:
+                logging.error(f"Failed to write UART command: {e}")
+    return False
 
-# --- ESP32 UART Telemetry Thread ---
-def esp32_uart_listener():
-    """Reads telemetry strings from ESP32 over /dev/serial0 (GPIO 14 TX, GPIO 15 RX)."""
-    global battery_data
-    try:
-        ser = serial.Serial('/dev/serial0', 9600, timeout=2)
-        logging.info("Connected to ESP32 UART on /dev/serial0")
-    except Exception as e:
-        logging.error(f"Failed to open UART to ESP32: {e}")
-        return
+def esp32_uart_worker():
+    """Background worker continuously reading ESP32 telemetry & maintaining UART connection."""
+    global esp32_data, serial_port
 
     while True:
         try:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            # Expected format: "VOLT:12.35,SOC:89%"
+            if serial_port is None or not serial_port.is_open:
+                serial_port = serial.Serial('/dev/serial0', 9600, timeout=1.5)
+                logging.info("Connected to ESP32 UART on /dev/serial0")
+
+            line = serial_port.readline().decode('utf-8', errors='ignore').strip()
+            # Expected format: "VOLT:12.35,SOC:89%,LED1:0,LED2:1"
             if "VOLT:" in line and "SOC:" in line:
                 parts = line.split(',')
-                volt_str = parts[0].replace("VOLT:", "").strip()
-                soc_str = parts[1].replace("SOC:", "").replace("%", "").strip()
+                volt = float(parts[0].replace("VOLT:", "").strip())
+                soc = int(parts[1].replace("SOC:", "").replace("%", "").strip())
                 
+                l1 = False
+                l2 = False
+                for p in parts[2:]:
+                    if "LED1:" in p:
+                        l1 = (p.replace("LED1:", "").strip() == "1")
+                    elif "LED2:" in p:
+                        l2 = (p.replace("LED2:", "").strip() == "1")
+
                 with state_lock:
-                    battery_data['voltage'] = float(volt_str)
-                    battery_data['soc'] = int(soc_str)
-                    battery_data['last_updated'] = datetime.now().isoformat()
-                    battery_data['connected'] = True
+                    esp32_data['voltage'] = volt
+                    esp32_data['soc'] = soc
+                    esp32_data['led1'] = l1
+                    esp32_data['led2'] = l2
+                    esp32_data['last_updated'] = datetime.now().isoformat()
+                    esp32_data['connected'] = True
+
         except Exception as e:
-            logging.debug(f"UART read error: {e}")
-            time.sleep(1)
+            logging.debug(f"UART communication error: {e}")
+            with state_lock:
+                esp32_data['connected'] = False
+            time.sleep(2)
 
 # --- Helper Functions ---
 def update_timer():
@@ -158,21 +183,19 @@ def shutdown_monitor():
             duration = current_time - timer
             is_client_active = client_status["status"]
 
+        # Power off after 15 minutes of inactivity and no active client
         if duration > 900 and not is_client_active:
             logging.warning("Inactivity shutdown triggered.")
-            for _ in range(5):
-                led1.toggle()
-                led2.toggle()
-                time.sleep(0.2)
+            send_esp32_cmd("LEDS:OFF")
+            send_esp32_cmd("RPI:SHUTDOWN")
+            time.sleep(1.0)
             check_call(['sudo', 'poweroff'])
 
+        # Enter idle mode after 300 seconds of inactivity (turn off UV LEDs)
         if duration > 300:
             if not idle_mode_active:
-                logging.info("Entering idle mode: Turning off LEDs.")
-                if led1.is_active:
-                    led1.off()
-                if led2.is_active:
-                    led2.off()
+                logging.info("Entering idle mode: Turning off UV LEDs via ESP32.")
+                send_esp32_cmd("LEDS:OFF")
                 idle_mode_active = True
         else:
             idle_mode_active = False
@@ -220,9 +243,46 @@ def device_status():
 
 @app.route('/battery')
 def battery_route():
-    """Returns real-time battery voltage and SOC from the ESP32."""
+    """Returns battery metrics & LED states from ESP32."""
     with state_lock:
-        return jsonify(battery_data)
+        return jsonify(esp32_data)
+
+@app.route('/led1_status')
+def led1_status_route():
+    with state_lock:
+        return jsonify(active=esp32_data['led1'])
+
+@app.route('/led2_status')
+def led2_status_route():
+    with state_lock:
+        return jsonify(active=esp32_data['led2'])
+
+@app.route('/uv_status')
+def uv_status_route():
+    with state_lock:
+        return jsonify(UV_A=esp32_data['led1'], UV_B=esp32_data['led2'])
+
+@app.route('/led1_toggle')
+def toggle_led1_route():
+    update_timer()
+    send_esp32_cmd("LED1:TOGGLE")
+    time.sleep(0.1)
+    with state_lock:
+        return jsonify(active=esp32_data['led1'])
+
+@app.route('/led2_toggle')
+def toggle_led2_route():
+    update_timer()
+    send_esp32_cmd("LED2:TOGGLE")
+    time.sleep(0.1)
+    with state_lock:
+        return jsonify(active=esp32_data['led2'])
+
+@app.route('/leds_off')
+def leds_off_route():
+    update_timer()
+    send_esp32_cmd("LEDS:OFF")
+    return jsonify(status="all_leds_off")
 
 @app.route('/capture', methods=['GET', 'POST'])
 def trigger_capture():
@@ -270,32 +330,11 @@ def list_files():
 def get_file(filename):
     return send_from_directory(IMAGE_DIRECTORY, filename)
 
-@app.route('/led1_status')
-def led1_status_route():
-    return jsonify(active=led1.is_active)
-
-@app.route('/led2_status')
-def led2_status_route():
-    return jsonify(active=led2.is_active)
-
-@app.route('/uv_status')
-def uv_status_route():
-    return jsonify(UV_A=led1.is_active, UV_B=led2.is_active)
-
-@app.route('/led1_toggle')
-def toggle_led1_route():
-    update_timer()
-    led1.toggle()
-    return jsonify(active=led1.is_active)
-
-@app.route('/led2_toggle')
-def toggle_led2_route():
-    update_timer()
-    led2.toggle()
-    return jsonify(active=led2.is_active)
-
 @app.route('/poweroff')
 def poweroff_route():
+    # Notify ESP32 to cut RPi main power rail after OS halts
+    send_esp32_cmd("LEDS:OFF")
+    send_esp32_cmd("RPI:SHUTDOWN")
     threading.Timer(1.0, lambda: check_call(['sudo', 'poweroff'])).start()
     return jsonify(status="powering_off")
 
@@ -321,8 +360,8 @@ def video_feed():
 
 # --- Hardware Button Listener ---
 def hardware_button_listener():
-    led1_button.when_pressed = lambda: (update_timer(), led1.toggle())
-    led2_button.when_pressed = lambda: (update_timer(), led2.toggle())
+    led1_button.when_pressed = lambda: (update_timer(), send_esp32_cmd("LED1:TOGGLE"))
+    led2_button.when_pressed = lambda: (update_timer(), send_esp32_cmd("LED2:TOGGLE"))
 
     capture_button.when_held = lambda: threading.Thread(target=capture_image, daemon=True).start()
     capture_button.when_pressed = update_timer
@@ -334,6 +373,6 @@ if __name__ == '__main__':
     threading.Thread(target=hardware_button_listener, daemon=True).start()
     threading.Thread(target=shutdown_monitor, daemon=True).start()
     threading.Thread(target=monitor_client, daemon=True).start()
-    threading.Thread(target=esp32_uart_listener, daemon=True).start()
+    threading.Thread(target=esp32_uart_worker, daemon=True).start()
 
     app.run(host='0.0.0.0', port=5000, threaded=True)
