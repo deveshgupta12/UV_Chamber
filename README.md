@@ -63,7 +63,7 @@ After reboot, join the hotspot from a phone or laptop:
 - **Auxiliary Controller (ESP32-C3 Super Mini):**
   - Switches the Raspberry Pi power rail (**GPIO 8**) through a high-side P-MOSFET (`IRF4905` driven by `PN2222A`), plus two UV LED channels: **UV LED 1 – 270 nm (GPIO 10)** and **UV LED 2 – 365 nm (GPIO 7)**.
   - Reads three debounced pushbuttons (active LOW): `SW_Led1` (GPIO 4), `SW_Led2` (GPIO 3), and `SW_RPi1` (GPIO 2).
-  - Monitors the 3S LiPo pack (12.6 V full) on **GPIO 1 (ADC1_CH1)** through a resistor divider, calibrated so that 12.29 V at the battery reads 2.18 V at the pin.
+  - Monitors the 3S LiPo pack (12.6 V full) on **GPIO 1 (ADC1_CH1)** through a **42 kΩ / 10 kΩ** resistor divider (nominal ratio 5.2). The firmware uses a measured calibration ratio instead of the nominal one: 12.29 V at the battery reads 2.18 V at the pin (≈ 5.64).
   - Applies Exponential Moving Average (EMA) filtering (α = 0.1) and computes State of Charge (SOC) using an 11-point non-linear discharge lookup table (10.50 V = 0 %, 12.60 V = 100 %).
   - Streams 1 Hz telemetry and button events to the Pi over UART1 (`GPIO 21 TX`, `GPIO 20 RX`, 9600 baud). The same commands are accepted over USB serial (115200 baud) for debugging.
   - Runs a safe-shutdown state machine that cuts Pi power only after the Pi confirms it has halted.
