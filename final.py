@@ -136,17 +136,21 @@ def esp32_uart_worker():
                 
                 l1 = False
                 l2 = False
+                rpi_on = True
                 for p in parts[2:]:
                     if "LED1:" in p:
                         l1 = (p.replace("LED1:", "").strip() == "1")
                     elif "LED2:" in p:
                         l2 = (p.replace("LED2:", "").strip() == "1")
+                    elif "RPI:" in p:
+                        rpi_on = (p.replace("RPI:", "").strip() == "1")
 
                 with state_lock:
                     esp32_data['voltage'] = volt
                     esp32_data['soc'] = soc
                     esp32_data['led1'] = l1
                     esp32_data['led2'] = l2
+                    esp32_data['rpi_power'] = rpi_on
                     esp32_data['last_updated'] = datetime.now().isoformat()
                     esp32_data['connected'] = True
 

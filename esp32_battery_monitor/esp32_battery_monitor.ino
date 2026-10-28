@@ -6,9 +6,10 @@
 
 // Battery Voltage Sensing
 const int BATTERY_PIN = 1;       // GPIO 1 (ADC1_CH1)
-const float R1 = 30000.0;        // R11 = 30k
-const float R2 = 10000.0;        // R12 = 10k
-const float DIVIDER_RATIO = (R1 + R2) / R2; // 4.0
+
+// Calibration: Measured Vin = 12.29V produces 2.18V at GPIO 1
+// Ratio = 12.29 / 2.18 = 5.6376
+const float DIVIDER_RATIO = 12.29 / 2.18; 
 
 // Power & LED Outputs
 const int PIN_RPI_PWR = 8;       // GPIO 8 -> RPi Power switch (IRF4905 via PN2222A)
@@ -18,7 +19,7 @@ const int PIN_LED_2   = 7;       // GPIO 7 -> UV LED 2 (365nm) switch
 // Pushbutton Inputs (Active LOW with external 10k pull-ups R8, R9, R10)
 const int BTN_LED1    = 4;       // GPIO 4 -> SW_Led1 (UV LED 1 toggle)
 const int BTN_LED2    = 3;       // GPIO 3 -> SW_Led2 (UV LED 2 toggle)
-const int BTN_RPI     = 2;       // GPIO 2 -> SW_RPi1 (Capture / RPi Power)
+const int BTN_RPI     = 2;       // GPIO 2 -> SW_RPi1 (Power On / Capture / Shutdown)
 
 // Hardware UART1 to Raspberry Pi (GPIO 14 TX, GPIO 15 RX)
 HardwareSerial RPiSerial(1);
@@ -31,6 +32,7 @@ const int RX_PIN = 20;           // GPIO 20 <- net RPI_TX <- RPi GPIO 14 (TX)
 
 bool led1State = false;
 bool led2State = false;
+bool rpiPowerState = true; // Tracks whether RPi main power rail is active
 
 // Debounce timing
 const unsigned long DEBOUNCE_DELAY_MS = 50;
@@ -89,7 +91,15 @@ void applyLEDStates() {
   digitalWrite(PIN_LED_2, led2State ? HIGH : LOW);
 }
 
+void powerOnRPi() {
+  shutdownPending = false;
+  rpiPowerState = true;
+  digitalWrite(PIN_RPI_PWR, HIGH);
+  Serial.println("[POWER] Raspberry Pi Power Rail turned ON (Q6 MOSFET Active).");
+}
+
 void triggerShutdown() {
+  if (!rpiPowerState) return; // Already off
   shutdownPending = true;
   shutdownTimer = millis();
   led1State = false;
@@ -139,6 +149,8 @@ void processIncomingCommand(String cmd) {
     Serial.println("[CMD] All UV LEDs -> ON");
   } else if (cmd == "RPI:SHUTDOWN") {
     triggerShutdown();
+  } else if (cmd == "RPI:ON") {
+    powerOnRPi();
   }
 }
 
@@ -157,7 +169,7 @@ void handleButtons() {
   if ((now - lastBtn1DebounceTime) > DEBOUNCE_DELAY_MS) {
     if (read1 != btn1State) {
       btn1State = read1;
-      if (btn1State == LOW) { // Button Pressed
+      if (btn1State == LOW) { // Pressed
         led1State = !led1State;
         applyLEDStates();
         Serial.println(String("[BUTTON] SW_Led1 pressed -> UV LED 1 toggled to ") + (led1State ? "ON" : "OFF"));
@@ -174,7 +186,7 @@ void handleButtons() {
   if ((now - lastBtn2DebounceTime) > DEBOUNCE_DELAY_MS) {
     if (read2 != btn2State) {
       btn2State = read2;
-      if (btn2State == LOW) { // Button Pressed
+      if (btn2State == LOW) { // Pressed
         led2State = !led2State;
         applyLEDStates();
         Serial.println(String("[BUTTON] SW_Led2 pressed -> UV LED 2 toggled to ") + (led2State ? "ON" : "OFF"));
@@ -194,16 +206,22 @@ void handleButtons() {
       if (btnRpiState == LOW) { // Pressed down
         btnRpiPressStartTime = now;
         btnRpiLongPressHandled = false;
+
+        // If RPi is currently powered OFF, any press powers it back ON!
+        if (!rpiPowerState) {
+          powerOnRPi();
+          btnRpiLongPressHandled = true; // Prevent triggering other actions on this press
+        }
       } else { // Released
-        if (!btnRpiLongPressHandled) {
-          // Short press: trigger autofocus capture on Raspberry Pi
+        if (rpiPowerState && !btnRpiLongPressHandled) {
+          // Short press while RPi is ON: trigger autofocus capture on Raspberry Pi
           RPiSerial.print("EVENT:CAPTURE\n");
           Serial.println("[BUTTON] SW_RPi1 short press -> Sent EVENT:CAPTURE to Raspberry Pi");
         }
       }
     }
-    // Check for long press (hold for >3 seconds to trigger shutdown)
-    if (btnRpiState == LOW && !btnRpiLongPressHandled) {
+    // Check for long press while RPi is ON (hold for >3 seconds to trigger shutdown)
+    if (rpiPowerState && btnRpiState == LOW && !btnRpiLongPressHandled) {
       if (now - btnRpiPressStartTime >= LONG_PRESS_DELAY_MS) {
         btnRpiLongPressHandled = true;
         Serial.println("[BUTTON] SW_RPi1 long press (>3s) -> Triggering System Shutdown");
@@ -234,8 +252,8 @@ void setup() {
   pinMode(BTN_LED2, INPUT_PULLUP);
   pinMode(BTN_RPI, INPUT_PULLUP);
 
-  // Power on Raspberry Pi by default
-  digitalWrite(PIN_RPI_PWR, HIGH);
+  // Power on Raspberry Pi on boot
+  powerOnRPi();
   applyLEDStates();
 
   Serial.println("ESP32 Super Mini Power, Battery, LEDs & Pushbutton Controller Initialized.");
@@ -263,8 +281,9 @@ void loop() {
 
   // 4. Handle delayed power cut after Pi shutdown request
   if (shutdownPending && (millis() - shutdownTimer >= SHUTDOWN_DELAY_MS)) {
-    Serial.println("[POWER] Cutting Raspberry Pi main power rail (Q6 MOSFET OFF).");
+    Serial.println("[POWER] 15 seconds elapsed. Cutting Raspberry Pi main power rail (Q6 MOSFET OFF).");
     digitalWrite(PIN_RPI_PWR, LOW);
+    rpiPowerState = false;
     shutdownPending = false;
   }
 
@@ -286,11 +305,12 @@ void loop() {
 
     int soc = calculateSOC(filteredVoltage);
 
-    // Payload: "VOLT:12.35,SOC:89%,LED1:0,LED2:0\n"
+    // Payload: "VOLT:12.29,SOC:87%,LED1:0,LED2:0,RPI:1\n"
     String payload = "VOLT:" + String(filteredVoltage, 2) + 
                      ",SOC:" + String(soc) + 
                      "%,LED1:" + String(led1State ? 1 : 0) + 
-                     ",LED2:" + String(led2State ? 1 : 0) + "\n";
+                     ",LED2:" + String(led2State ? 1 : 0) + 
+                     ",RPI:" + String(rpiPowerState ? 1 : 0) + "\n";
     
     RPiSerial.print(payload);
     Serial.print("Telemetry -> " + payload);
