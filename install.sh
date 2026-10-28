@@ -137,6 +137,46 @@ EOF
 chmod +x /lib/systemd/system-shutdown/esp32_notify.sh
 echo "[+] esp32_notify.sh installed!"
 
+# 9. Configure Wi-Fi Hotspot (Pi broadcasts its own network instead of joining one)
+HOTSPOT_SSID="uvbox"
+HOTSPOT_PASSWORD="uvbox@123"
+HOTSPOT_CON="uvbox-hotspot"
+HOTSPOT_IP="10.42.0.1"
+
+echo "[+] Configuring Wi-Fi hotspot (SSID: $HOTSPOT_SSID)..."
+
+if ! command -v nmcli >/dev/null 2>&1; then
+    echo "[-] NetworkManager (nmcli) not found. Hotspot setup requires Raspberry Pi OS Bookworm or newer."
+    exit 1
+fi
+
+# dnsmasq-base provides DHCP for clients that join the hotspot
+apt-get install -y dnsmasq-base
+rfkill unblock wlan 2>/dev/null || true
+
+# Replace any previous hotspot profile so re-running the installer is safe
+nmcli connection delete "$HOTSPOT_CON" 2>/dev/null || true
+
+nmcli connection add type wifi ifname wlan0 con-name "$HOTSPOT_CON" ssid "$HOTSPOT_SSID" \
+    autoconnect yes connection.autoconnect-priority 100 \
+    802-11-wireless.mode ap 802-11-wireless.band bg 802-11-wireless.channel 6 \
+    wifi-sec.key-mgmt wpa-psk wifi-sec.proto rsn \
+    wifi-sec.pairwise ccmp wifi-sec.group ccmp wifi-sec.pmf disable \
+    wifi-sec.psk "$HOTSPOT_PASSWORD" \
+    ipv4.method shared ipv4.addresses "$HOTSPOT_IP/24" \
+    ipv6.method disabled
+
+# Stop the Pi from auto-joining saved Wi-Fi networks so wlan0 stays in hotspot mode.
+# The hotspot is not activated now, to avoid dropping an SSH session over Wi-Fi mid-install;
+# it comes up on the next boot.
+HOTSPOT_UUID="$(nmcli -g connection.uuid connection show "$HOTSPOT_CON")"
+nmcli -t -f UUID,TYPE connection show \
+    | awk -F: -v skip="$HOTSPOT_UUID" '$2 == "802-11-wireless" && $1 != skip {print $1}' \
+    | while read -r uuid; do
+        nmcli connection modify "$uuid" connection.autoconnect no
+    done
+echo "[+] Hotspot '$HOTSPOT_SSID' configured (activates on next boot)!"
+
 echo "=========================================================="
 echo " Installation Complete!"
 echo "----------------------------------------------------------"
@@ -146,10 +186,16 @@ echo ""
 echo " 2. View live logs:"
 echo "    sudo journalctl -u uv_chamber.service -f"
 echo ""
-echo " 3. Check web interface:"
-echo "    http://<pi-ip-address>:5000/video_feed"
-echo "    http://<pi-ip-address>:5000/battery"
+echo " 3. Check web interface (after joining the '$HOTSPOT_SSID' Wi-Fi):"
+echo "    http://$HOTSPOT_IP:5000/video_feed"
+echo "    http://$HOTSPOT_IP:5000/battery"
 echo ""
-echo " NOTE: A reboot is recommended to apply UART & group changes:"
+echo " Wi-Fi hotspot (active after reboot):"
+echo "    SSID:     $HOTSPOT_SSID"
+echo "    Password: $HOTSPOT_PASSWORD"
+echo "    Pi IP:    $HOTSPOT_IP  (SSH: ssh $TARGET_USER@$HOTSPOT_IP)"
+echo ""
+echo " NOTE: A reboot is required to apply UART, group & hotspot changes."
+echo "       After reboot the Pi will no longer join your Wi-Fi network."
 echo "       sudo reboot"
 echo "=========================================================="
