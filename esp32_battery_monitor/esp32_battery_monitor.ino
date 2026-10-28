@@ -6,9 +6,7 @@
 
 // Battery Voltage Sensing
 const int BATTERY_PIN = 1;       // GPIO 1 (ADC1_CH1)
-
-// Calibration: Measured Vin = 12.29V produces 2.18V at GPIO 1
-// Ratio = 12.29 / 2.18 = 5.6376
+// Calibrated ratio: 12.29V input produces 2.18V at GPIO 1
 const float DIVIDER_RATIO = 12.29 / 2.18; 
 
 // Power & LED Outputs
@@ -27,12 +25,26 @@ const int TX_PIN = 21;           // GPIO 21 -> net RPI_RX -> RPi GPIO 15 (RX)
 const int RX_PIN = 20;           // GPIO 20 <- net RPI_TX <- RPi GPIO 14 (TX)
 
 // ==============================================================================
-// STATE VARIABLES
+// STATE DEFINITIONS & TIMERS
 // ==============================================================================
 
 bool led1State = false;
 bool led2State = false;
-bool rpiPowerState = true; // Tracks whether RPi main power rail is active
+bool rpiPowerState = true;
+
+// Shutdown State Machine
+enum ShutdownState {
+  STATE_IDLE,                 // Normal operation
+  STATE_WAITING_FOR_HALT,     // Shutdown command sent; waiting for RPi to signal 'RPI:HALTED'
+  STATE_POST_HALT_DELAY       // 'RPI:HALTED' confirmed; waiting 7.5s grace period before cutting power
+};
+
+ShutdownState shutdownState = STATE_IDLE;
+
+// Timing Constants
+const unsigned long HALT_TIMEOUT_MS    = 25000; // 25s timeout to receive 'RPI:HALTED'
+const unsigned long POST_HALT_DELAY_MS = 7500;  // 7.5s wait after halt signal before cutting power
+unsigned long shutdownTimer = 0;
 
 // Debounce timing
 const unsigned long DEBOUNCE_DELAY_MS = 50;
@@ -54,11 +66,6 @@ int btnRpiState = HIGH;
 unsigned long lastBtnRpiDebounceTime = 0;
 unsigned long btnRpiPressStartTime = 0;
 bool btnRpiLongPressHandled = false;
-
-// Shutdown coordination timer
-bool shutdownPending = false;
-unsigned long shutdownTimer = 0;
-const unsigned long SHUTDOWN_DELAY_MS = 15000; // 15 sec delay for clean Pi OS unmount
 
 // Battery filter & telemetry
 float filteredVoltage = -1.0;
@@ -92,21 +99,27 @@ void applyLEDStates() {
 }
 
 void powerOnRPi() {
-  shutdownPending = false;
+  shutdownState = STATE_IDLE;
   rpiPowerState = true;
   digitalWrite(PIN_RPI_PWR, HIGH);
   Serial.println("[POWER] Raspberry Pi Power Rail turned ON (Q6 MOSFET Active).");
 }
 
 void triggerShutdown() {
-  if (!rpiPowerState) return; // Already off
-  shutdownPending = true;
+  if (!rpiPowerState || shutdownState != STATE_IDLE) return;
+  
+  // Enter waiting state
+  shutdownState = STATE_WAITING_FOR_HALT;
   shutdownTimer = millis();
+
+  // Turn off UV LEDs to reduce load during shutdown
   led1State = false;
   led2State = false;
   applyLEDStates();
+
+  // Send shutdown request to Raspberry Pi
   RPiSerial.print("EVENT:SHUTDOWN\n");
-  Serial.println("[CMD] Shutdown initiated. Cutting Pi power in 15 seconds...");
+  Serial.println("[SHUTDOWN] Shutdown initiated. Waiting for 'RPI:HALTED' confirmation (Timeout: 25s)...");
 }
 
 void processIncomingCommand(String cmd) {
@@ -149,6 +162,13 @@ void processIncomingCommand(String cmd) {
     Serial.println("[CMD] All UV LEDs -> ON");
   } else if (cmd == "RPI:SHUTDOWN") {
     triggerShutdown();
+  } else if (cmd == "RPI:HALTED") {
+    // The Raspberry Pi OS has finished unmounting and reached the final system-shutdown hook
+    if (shutdownState == STATE_WAITING_FOR_HALT) {
+      shutdownState = STATE_POST_HALT_DELAY;
+      shutdownTimer = millis();
+      Serial.println("[SHUTDOWN] 'RPI:HALTED' confirmed! Waiting 7.5s for SoC to finish halt before cutting power...");
+    }
   } else if (cmd == "RPI:ON") {
     powerOnRPi();
   }
@@ -210,7 +230,7 @@ void handleButtons() {
         // If RPi is currently powered OFF, any press powers it back ON!
         if (!rpiPowerState) {
           powerOnRPi();
-          btnRpiLongPressHandled = true; // Prevent triggering other actions on this press
+          btnRpiLongPressHandled = true;
         }
       } else { // Released
         if (rpiPowerState && !btnRpiLongPressHandled) {
@@ -256,10 +276,12 @@ void setup() {
   powerOnRPi();
   applyLEDStates();
 
-  Serial.println("ESP32 Super Mini Power, Battery, LEDs & Pushbutton Controller Initialized.");
+  Serial.println("ESP32 Super Mini Power, Battery, LEDs & Handshake Controller Initialized.");
 }
 
 void loop() {
+  unsigned long now = millis();
+
   // 1. Service Physical Pushbuttons
   handleButtons();
 
@@ -279,16 +301,28 @@ void loop() {
     }
   }
 
-  // 4. Handle delayed power cut after Pi shutdown request
-  if (shutdownPending && (millis() - shutdownTimer >= SHUTDOWN_DELAY_MS)) {
-    Serial.println("[POWER] 15 seconds elapsed. Cutting Raspberry Pi main power rail (Q6 MOSFET OFF).");
-    digitalWrite(PIN_RPI_PWR, LOW);
-    rpiPowerState = false;
-    shutdownPending = false;
+  // 4. Safe Shutdown State Machine
+  if (shutdownState == STATE_WAITING_FOR_HALT) {
+    // Check if timeout elapsed without receiving 'RPI:HALTED'
+    if (now - shutdownTimer >= HALT_TIMEOUT_MS) {
+      shutdownState = STATE_IDLE; // Cancel shutdown
+      // Keep PIN_RPI_PWR HIGH!
+      Serial.println("=================================================================");
+      Serial.println("[ERROR / SAFETY] Shutdown TIMEOUT! 'RPI:HALTED' signal not received.");
+      Serial.println("[SAFETY ALERT] Power cut ABORTED to protect Raspberry Pi filesystem!");
+      Serial.println("=================================================================");
+    }
+  } else if (shutdownState == STATE_POST_HALT_DELAY) {
+    // 7.5 seconds grace period after RPi reported HALTED
+    if (now - shutdownTimer >= POST_HALT_DELAY_MS) {
+      Serial.println("[POWER] 7.5s post-halt elapsed. Cutting Raspberry Pi main power rail (Q6 MOSFET OFF).");
+      digitalWrite(PIN_RPI_PWR, LOW);
+      rpiPowerState = false;
+      shutdownState = STATE_IDLE;
+    }
   }
 
   // 5. Periodic telemetry transmission every 1000ms
-  unsigned long now = millis();
   if (now - lastTelemetryTime >= 1000) {
     lastTelemetryTime = now;
 

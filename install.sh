@@ -123,6 +123,20 @@ systemctl daemon-reload
 systemctl enable uv_chamber.service
 echo "[+] uv_chamber.service enabled on boot!"
 
+# 8. Install Systemd Final Shutdown Hook for ESP32 Handshake
+echo "[+] Installing systemd final shutdown hook (/lib/systemd/system-shutdown/esp32_notify.sh)..."
+mkdir -p /lib/systemd/system-shutdown
+cat << 'EOF' > /lib/systemd/system-shutdown/esp32_notify.sh
+#!/bin/sh
+# Runs at the absolute final stage of Linux shutdown after all filesystems are remounted read-only
+if [ "$1" = "poweroff" ] || [ "$1" = "halt" ]; then
+    stty -F /dev/serial0 9600 2>/dev/null || true
+    printf "RPI:HALTED\n" > /dev/serial0 2>/dev/null || true
+fi
+EOF
+chmod +x /lib/systemd/system-shutdown/esp32_notify.sh
+echo "[+] esp32_notify.sh installed!"
+
 echo "=========================================================="
 echo " Installation Complete!"
 echo "----------------------------------------------------------"
