@@ -113,6 +113,21 @@ def esp32_uart_worker():
                 logging.info("Connected to ESP32 UART on /dev/serial0")
 
             line = serial_port.readline().decode('utf-8', errors='ignore').strip()
+            
+            # Hardware event triggers from ESP32 pushbuttons
+            if line == "EVENT:CAPTURE":
+                logging.info("Hardware capture button triggered from ESP32 (SW_RPi1)")
+                update_timer()
+                with state_lock:
+                    if not capture_in_progress:
+                        capture_in_progress = True
+                        threading.Thread(target=capture_image, daemon=True).start()
+                continue
+            elif line == "EVENT:SHUTDOWN":
+                logging.warning("Hardware shutdown event received from ESP32 (SW_RPi1 held >3s)")
+                threading.Timer(1.0, lambda: check_call(['sudo', 'poweroff'])).start()
+                continue
+
             # Expected format: "VOLT:12.35,SOC:89%,LED1:0,LED2:1"
             if "VOLT:" in line and "SOC:" in line:
                 parts = line.split(',')
