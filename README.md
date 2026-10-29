@@ -125,7 +125,7 @@ The ESP32 never cuts power to the Pi until Linux has finished shutting down, pro
 1. Shutdown is triggered by holding `SW_RPi1` for 3 s, calling `/poweroff`, or the 15-minute inactivity timer. (Pi-initiated shutdowns send `RPI:SHUTDOWN` to the ESP32 first.)
 2. The ESP32 turns off both UV LEDs, sends `EVENT:SHUTDOWN` to the Pi, and waits up to **25 s** for confirmation.
 3. The Pi runs `sudo poweroff`. At the final stage of shutdown, `esp32_notify.sh` sends `RPI:HALTED`.
-4. The ESP32 waits a further **7.5 s** grace period, then cuts the Pi power rail.
+4. The ESP32 waits a further **10 s** grace period, then cuts the Pi power rail.
 5. If `RPI:HALTED` is not received within 25 s, the ESP32 **aborts** the power cut and keeps the Pi powered.
 
 Press `SW_RPi1` to power the Pi back on.

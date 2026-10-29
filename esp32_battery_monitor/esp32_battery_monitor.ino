@@ -36,14 +36,14 @@ bool rpiPowerState = true;
 enum ShutdownState {
   STATE_IDLE,                 // Normal operation
   STATE_WAITING_FOR_HALT,     // Shutdown command sent; waiting for RPi to signal 'RPI:HALTED'
-  STATE_POST_HALT_DELAY       // 'RPI:HALTED' confirmed; waiting 7.5s grace period before cutting power
+  STATE_POST_HALT_DELAY       // 'RPI:HALTED' confirmed; waiting 10s grace period before cutting power
 };
 
 ShutdownState shutdownState = STATE_IDLE;
 
 // Timing Constants
 const unsigned long HALT_TIMEOUT_MS    = 25000; // 25s timeout to receive 'RPI:HALTED'
-const unsigned long POST_HALT_DELAY_MS = 7500;  // 7.5s wait after halt signal before cutting power
+const unsigned long POST_HALT_DELAY_MS = 10000; // 10s wait after halt signal before cutting power
 unsigned long shutdownTimer = 0;
 
 // Debounce timing
@@ -179,7 +179,7 @@ void processIncomingCommand(String cmd) {
     if (shutdownState == STATE_WAITING_FOR_HALT) {
       shutdownState = STATE_POST_HALT_DELAY;
       shutdownTimer = millis();
-      Serial.println(String("[SHUTDOWN @") + shutdownTimer + "ms] 'RPI:HALTED' confirmed! Starting 7.5s grace period...");
+      Serial.println(String("[SHUTDOWN @") + shutdownTimer + "ms] 'RPI:HALTED' confirmed! Starting 10s grace period...");
       // Drain any remaining bytes in the UART buffer — during halt the line may produce garbage
       while (RPiSerial.available()) RPiSerial.read();
     } else {
@@ -338,7 +338,7 @@ void loop() {
     if (now >= shutdownTimer) {
       unsigned long elapsed = now - shutdownTimer;
       if (elapsed >= POST_HALT_DELAY_MS) {
-        Serial.println(String("[POWER @") + now + "ms] 7.5s post-halt elapsed (actual: " + elapsed + "ms). Cutting RPi power (Q6 MOSFET OFF).");
+        Serial.println(String("[POWER @") + now + "ms] 10s post-halt elapsed (actual: " + elapsed + "ms). Cutting RPi power (Q6 MOSFET OFF).");
         digitalWrite(PIN_RPI_PWR, LOW);
         rpiPowerState = false;
         shutdownState = STATE_IDLE;
