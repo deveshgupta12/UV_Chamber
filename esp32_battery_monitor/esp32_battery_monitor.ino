@@ -105,6 +105,11 @@ void powerOnRPi() {
   Serial.println("[POWER] Raspberry Pi Power Rail turned ON (Q6 MOSFET Active).");
 }
 
+void sendEventToAll(const String& event) {
+  RPiSerial.print(event);
+  Serial.print(event); // Mirrors raw event to USB Serial as well
+}
+
 void triggerShutdown() {
   if (!rpiPowerState || shutdownState != STATE_IDLE) return;
   
@@ -117,8 +122,8 @@ void triggerShutdown() {
   led2State = false;
   applyLEDStates();
 
-  // Send shutdown request to Raspberry Pi
-  RPiSerial.print("EVENT:SHUTDOWN\n");
+  // Send shutdown request to both Raspberry Pi UART and USB
+  sendEventToAll("EVENT:SHUTDOWN\n");
   Serial.println("[SHUTDOWN] Shutdown initiated. Waiting for 'RPI:HALTED' confirmation (Timeout: 25s)...");
 }
 
@@ -235,7 +240,7 @@ void handleButtons() {
       } else { // Released
         if (rpiPowerState && !btnRpiLongPressHandled) {
           // Short press while RPi is ON: trigger autofocus capture on Raspberry Pi
-          RPiSerial.print("EVENT:CAPTURE\n");
+          sendEventToAll("EVENT:CAPTURE\n");
           Serial.println("[BUTTON] SW_RPi1 short press -> Sent EVENT:CAPTURE to Raspberry Pi");
         }
       }
@@ -285,18 +290,22 @@ void loop() {
   // 1. Service Physical Pushbuttons
   handleButtons();
 
-  // 2. Process incoming commands from Raspberry Pi UART
+  // 2. Process incoming commands from Raspberry Pi UART (Hardware UART1)
   while (RPiSerial.available()) {
     String cmd = RPiSerial.readStringUntil('\n');
     if (cmd.length() > 0) {
+      Serial.print("[RPi->ESP32 UART]: ");
+      Serial.println(cmd);
       processIncomingCommand(cmd);
     }
   }
 
-  // 3. Process commands from USB CDC Serial Monitor for manual debugging
+  // 3. Process commands from USB CDC Serial Monitor for manual debugging / direct control
   while (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     if (cmd.length() > 0) {
+      Serial.print("[USB->ESP32]: ");
+      Serial.println(cmd);
       processIncomingCommand(cmd);
     }
   }
@@ -339,14 +348,15 @@ void loop() {
 
     int soc = calculateSOC(filteredVoltage);
 
-    // Payload: "VOLT:12.29,SOC:87%,LED1:0,LED2:0,RPI:1\n"
+    // Standard telemetry packet: "VOLT:12.29,SOC:87%,LED1:0,LED2:0,RPI:1\n"
     String payload = "VOLT:" + String(filteredVoltage, 2) + 
                      ",SOC:" + String(soc) + 
                      "%,LED1:" + String(led1State ? 1 : 0) + 
                      ",LED2:" + String(led2State ? 1 : 0) + 
                      ",RPI:" + String(rpiPowerState ? 1 : 0) + "\n";
     
+    // Transmit exact same packet on both Raspberry Pi UART and USB CDC Serial
     RPiSerial.print(payload);
-    Serial.print("Telemetry -> " + payload);
+    Serial.print(payload);
   }
 }
