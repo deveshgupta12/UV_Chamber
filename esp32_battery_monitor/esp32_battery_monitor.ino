@@ -322,9 +322,10 @@ void loop() {
   }
 
   // 4. Safe Shutdown State Machine
+  now = millis(); // Refresh timestamp so it is always >= timestamps set in step 2 or 3
   if (shutdownState == STATE_WAITING_FOR_HALT) {
     // Check if timeout elapsed without receiving 'RPI:HALTED'
-    if (now - shutdownTimer >= HALT_TIMEOUT_MS) {
+    if (now >= shutdownTimer && (now - shutdownTimer >= HALT_TIMEOUT_MS)) {
       shutdownState = STATE_IDLE; // Cancel shutdown
       // Keep PIN_RPI_PWR HIGH!
       Serial.println("=================================================================");
@@ -334,12 +335,14 @@ void loop() {
     }
   } else if (shutdownState == STATE_POST_HALT_DELAY) {
     // 7.5 seconds grace period after RPi reported HALTED
-    unsigned long elapsed = now - shutdownTimer;
-    if (elapsed >= POST_HALT_DELAY_MS) {
-      Serial.println(String("[POWER @") + now + "ms] 7.5s post-halt elapsed (actual: " + elapsed + "ms). Cutting RPi power (Q6 MOSFET OFF).");
-      digitalWrite(PIN_RPI_PWR, LOW);
-      rpiPowerState = false;
-      shutdownState = STATE_IDLE;
+    if (now >= shutdownTimer) {
+      unsigned long elapsed = now - shutdownTimer;
+      if (elapsed >= POST_HALT_DELAY_MS) {
+        Serial.println(String("[POWER @") + now + "ms] 7.5s post-halt elapsed (actual: " + elapsed + "ms). Cutting RPi power (Q6 MOSFET OFF).");
+        digitalWrite(PIN_RPI_PWR, LOW);
+        rpiPowerState = false;
+        shutdownState = STATE_IDLE;
+      }
     }
   }
 
