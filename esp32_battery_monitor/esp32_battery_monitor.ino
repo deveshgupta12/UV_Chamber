@@ -124,12 +124,19 @@ void triggerShutdown() {
 
   // Send shutdown request to both Raspberry Pi UART and USB
   sendEventToAll("EVENT:SHUTDOWN\n");
-  Serial.println("[SHUTDOWN] Shutdown initiated. Waiting for 'RPI:HALTED' confirmation (Timeout: 25s)...");
+  Serial.println(String("[SHUTDOWN @") + millis() + "ms] Shutdown initiated. Waiting for 'RPI:HALTED' (Timeout: 25s)...");
 }
 
 void processIncomingCommand(String cmd) {
   cmd.trim();
   cmd.toUpperCase();
+
+  // During post-halt delay, ignore ALL commands — the Pi is halting and the UART
+  // line may produce noise/garbage that we must discard.
+  if (shutdownState == STATE_POST_HALT_DELAY) {
+    Serial.println(String("[SHUTDOWN @") + millis() + "ms] Ignoring command during post-halt grace period: " + cmd);
+    return;
+  }
 
   if (cmd == "LED1:ON" || cmd == "LED1:1") {
     led1State = true;
@@ -172,7 +179,11 @@ void processIncomingCommand(String cmd) {
     if (shutdownState == STATE_WAITING_FOR_HALT) {
       shutdownState = STATE_POST_HALT_DELAY;
       shutdownTimer = millis();
-      Serial.println("[SHUTDOWN] 'RPI:HALTED' confirmed! Waiting 7.5s for SoC to finish halt before cutting power...");
+      Serial.println(String("[SHUTDOWN @") + shutdownTimer + "ms] 'RPI:HALTED' confirmed! Starting 7.5s grace period...");
+      // Drain any remaining bytes in the UART buffer — during halt the line may produce garbage
+      while (RPiSerial.available()) RPiSerial.read();
+    } else {
+      Serial.println(String("[SHUTDOWN @") + millis() + "ms] Received 'RPI:HALTED' but not in WAITING_FOR_HALT state (state=" + shutdownState + "). Ignored.");
     }
   } else if (cmd == "RPI:ON") {
     powerOnRPi();
@@ -317,14 +328,15 @@ void loop() {
       shutdownState = STATE_IDLE; // Cancel shutdown
       // Keep PIN_RPI_PWR HIGH!
       Serial.println("=================================================================");
-      Serial.println("[ERROR / SAFETY] Shutdown TIMEOUT! 'RPI:HALTED' signal not received.");
+      Serial.println(String("[ERROR / SAFETY @") + now + "ms] Shutdown TIMEOUT! 'RPI:HALTED' not received.");
       Serial.println("[SAFETY ALERT] Power cut ABORTED to protect Raspberry Pi filesystem!");
       Serial.println("=================================================================");
     }
   } else if (shutdownState == STATE_POST_HALT_DELAY) {
     // 7.5 seconds grace period after RPi reported HALTED
-    if (now - shutdownTimer >= POST_HALT_DELAY_MS) {
-      Serial.println("[POWER] 7.5s post-halt elapsed. Cutting Raspberry Pi main power rail (Q6 MOSFET OFF).");
+    unsigned long elapsed = now - shutdownTimer;
+    if (elapsed >= POST_HALT_DELAY_MS) {
+      Serial.println(String("[POWER @") + now + "ms] 7.5s post-halt elapsed (actual: " + elapsed + "ms). Cutting RPi power (Q6 MOSFET OFF).");
       digitalWrite(PIN_RPI_PWR, LOW);
       rpiPowerState = false;
       shutdownState = STATE_IDLE;
