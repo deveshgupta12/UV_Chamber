@@ -9,10 +9,15 @@ const int BATTERY_PIN = 1;       // GPIO 1 (ADC1_CH1)
 // Calibrated ratio: 12.29V input produces 2.18V at GPIO 1
 const float DIVIDER_RATIO = 12.29 / 2.18; 
 
-// Power & LED Outputs
+// Power & UV LED Outputs
 const int PIN_RPI_PWR = 8;       // GPIO 8 -> RPi Power switch (IRF4905 via PN2222A)
 const int PIN_LED_1   = 10;      // GPIO 10 -> UV LED 1 (270nm) switch
 const int PIN_LED_2   = 7;       // GPIO 7 -> UV LED 2 (365nm) switch
+
+// Status Indicator LEDs (Active HIGH)
+const int IND_RPI_STATUS = 5;    // GPIO 5 -> RPi Status LED (Solid ON = running, Fast blink = shutting down, OFF = powered off)
+const int IND_BATTERY    = 6;    // GPIO 6 -> Battery Indicator LED (Slow pulse = charging/good, Rapid blink = low battery <20%, OFF = normal/standby)
+const int IND_UV_STATUS  = 0;    // GPIO 0 -> UV Active Indicator LED (Single blink = UV1 only, Double blink = UV2 only, Solid ON = both UV1+UV2, OFF = all UV OFF)
 
 // Pushbutton Inputs (Active LOW with external 10k pull-ups R8, R9, R10)
 const int BTN_LED1    = 4;       // GPIO 4 -> SW_Led1 (UV LED 1 toggle)
@@ -71,6 +76,16 @@ bool btnRpiLongPressHandled = false;
 float filteredVoltage = -1.0;
 const float SMOOTHING_FACTOR = 0.1;
 unsigned long lastTelemetryTime = 0;
+int currentSOC = 0;
+
+// Battery Charging Detection
+bool isCharging = false;
+float previousVoltage = -1.0;
+unsigned long lastChargeCheckTime = 0;
+
+// Non-blocking Indicator Update Timing
+unsigned long lastIndicatorUpdateTime = 0;
+const unsigned long INDICATOR_INTERVAL_MS = 50; // 20Hz update loop
 
 // ==============================================================================
 // HELPER FUNCTIONS
@@ -96,6 +111,81 @@ int calculateSOC(float voltage) {
 void applyLEDStates() {
   digitalWrite(PIN_LED_1, led1State ? HIGH : LOW);
   digitalWrite(PIN_LED_2, led2State ? HIGH : LOW);
+}
+
+// ==============================================================================
+// STATUS INDICATOR LED PATTERN HANDLER (GPIO 5, 6, 0)
+// ==============================================================================
+void updateIndicatorLEDs() {
+  unsigned long now = millis();
+
+  // --------------------------------------------------------------------------
+  // 1. RPi Status Indicator (GPIO 5)
+  //    - Solid ON:      RPi is running normally (rpiPowerState = true, shutdownState = STATE_IDLE)
+  //    - Fast Blink:    RPi is shutting down (STATE_WAITING_FOR_HALT or STATE_POST_HALT_DELAY)
+  //    - OFF:           RPi power rail is cut / OFF
+  // --------------------------------------------------------------------------
+  if (!rpiPowerState) {
+    digitalWrite(IND_RPI_STATUS, LOW); // OFF
+  } else if (shutdownState == STATE_WAITING_FOR_HALT || shutdownState == STATE_POST_HALT_DELAY) {
+    // Fast blink (200ms period: 100ms ON / 100ms OFF)
+    bool blinkPhase = ((now / 100) % 2) == 0;
+    digitalWrite(IND_RPI_STATUS, blinkPhase ? HIGH : LOW);
+  } else {
+    // Normal operation: Solid ON
+    digitalWrite(IND_RPI_STATUS, HIGH);
+  }
+
+  // --------------------------------------------------------------------------
+  // 2. Battery Status Indicator (GPIO 6)
+  //    - Rapid Flash:   Low Battery (filteredVoltage <= 11.20V or currentSOC <= 15%)
+  //    - Breathing/Pulse: Battery is Charging (voltage > 12.65V or actively charging)
+  //    - Solid ON:      Battery Normal & Healthy (> 11.40V)
+  //    - OFF:           Standby / system idle
+  // --------------------------------------------------------------------------
+  bool isLowBattery = (filteredVoltage > 0 && (filteredVoltage <= 11.20 || currentSOC <= 15));
+  bool isHighCharge = (filteredVoltage >= 12.65 || isCharging);
+
+  if (isLowBattery) {
+    // Rapid strobe warning: 150ms cycle (75ms ON / 75ms OFF)
+    bool fastBlink = ((now / 75) % 2) == 0;
+    digitalWrite(IND_BATTERY, fastBlink ? HIGH : LOW);
+  } else if (isHighCharge) {
+    // Slow breathing / pulse pattern while charging (1000ms period: 500ms ON / 500ms OFF)
+    bool chargeBlink = ((now / 500) % 2) == 0;
+    digitalWrite(IND_BATTERY, chargeBlink ? HIGH : LOW);
+  } else if (filteredVoltage > 11.40) {
+    // Healthy battery: Solid ON
+    digitalWrite(IND_BATTERY, HIGH);
+  } else {
+    // Below 11.40V but above critical: Slow 1s flash
+    bool medBlink = ((now / 1000) % 2) == 0;
+    digitalWrite(IND_BATTERY, medBlink ? HIGH : LOW);
+  }
+
+  // --------------------------------------------------------------------------
+  // 3. UV LED Status Indicator (GPIO 0)
+  //    - Solid ON:      Both UV1 and UV2 are active
+  //    - Single Heartbeat: UV1 (270nm) only is active
+  //    - Double Heartbeat: UV2 (365nm) only is active
+  //    - OFF:           Both UV LEDs are OFF
+  // --------------------------------------------------------------------------
+  if (led1State && led2State) {
+    // Both ON -> Solid indicator
+    digitalWrite(IND_UV_STATUS, HIGH);
+  } else if (led1State && !led2State) {
+    // UV 1 only -> Single pulse every 800ms (100ms flash, 700ms pause)
+    unsigned long phase = now % 800;
+    digitalWrite(IND_UV_STATUS, (phase < 120) ? HIGH : LOW);
+  } else if (!led1State && led2State) {
+    // UV 2 only -> Double pulse every 800ms (flash-gap-flash-long pause)
+    unsigned long phase = now % 800;
+    bool doublePulse = (phase < 100) || (phase >= 200 && phase < 300);
+    digitalWrite(IND_UV_STATUS, doublePulse ? HIGH : LOW);
+  } else {
+    // All UV OFF
+    digitalWrite(IND_UV_STATUS, LOW);
+  }
 }
 
 void powerOnRPi() {
@@ -282,6 +372,16 @@ void setup() {
   pinMode(PIN_RPI_PWR, OUTPUT);
   pinMode(PIN_LED_1, OUTPUT);
   pinMode(PIN_LED_2, OUTPUT);
+
+  // Status Indicator LED Outputs (Active HIGH)
+  pinMode(IND_RPI_STATUS, OUTPUT);
+  pinMode(IND_BATTERY, OUTPUT);
+  pinMode(IND_UV_STATUS, OUTPUT);
+
+  // Initial indicator state
+  digitalWrite(IND_RPI_STATUS, LOW);
+  digitalWrite(IND_BATTERY, LOW);
+  digitalWrite(IND_UV_STATUS, LOW);
   
   // Pushbutton Inputs (with internal pullups enabled as extra safety)
   pinMode(BTN_LED1, INPUT_PULLUP);
@@ -362,6 +462,18 @@ void loop() {
     }
 
     int soc = calculateSOC(filteredVoltage);
+    currentSOC = soc;
+
+    // Check voltage trend every 5 seconds to detect active charging
+    if (now - lastChargeCheckTime >= 5000) {
+      if (previousVoltage > 0 && (filteredVoltage - previousVoltage) > 0.04) {
+        isCharging = true;
+      } else if (filteredVoltage < 12.50 && previousVoltage > 0 && (filteredVoltage <= previousVoltage)) {
+        isCharging = false;
+      }
+      previousVoltage = filteredVoltage;
+      lastChargeCheckTime = now;
+    }
 
     // Standard telemetry packet: "VOLT:12.29,SOC:87%,LED1:0,LED2:0,RPI:1\n"
     String payload = "VOLT:" + String(filteredVoltage, 2) + 
@@ -373,5 +485,11 @@ void loop() {
     // Transmit exact same packet on both Raspberry Pi UART and USB CDC Serial
     RPiSerial.print(payload);
     Serial.print(payload);
+  }
+
+  // 6. Refresh Status Indicator LEDs at 20Hz (non-blocking)
+  if (now - lastIndicatorUpdateTime >= INDICATOR_INTERVAL_MS) {
+    lastIndicatorUpdateTime = now;
+    updateIndicatorLEDs();
   }
 }
